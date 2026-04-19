@@ -148,3 +148,47 @@ When a client disconnects or an error occurs:
 
 1. Remove FD using `epoll_ctl(..., EPOLL_CTL_DEL, ...)`
 2. Close the socket using `close()`
+
+## How the Server Works
+
+1. Create listening socket  
+2. Create epoll instance  
+3. Register socket with epoll  
+4. Enter event loop using `epoll_wait()`  
+5. Accept new connections when ready  
+6. Read/write client data  
+7. Handle cleanup when clients disconnect  
+
+---
+
+## Implementation Details
+
+The server uses:
+
+- Non-blocking sockets via `fcntl()`
+- Event-driven I/O using `epoll`
+- Efficient per-connection state tracking
+
+This design avoids blocking calls and allows a single thread to handle many clients efficiently.
+
+---
+
+## Key Takeaways
+
+- `epoll` is more scalable than `select` or `poll`
+- Non-blocking I/O is essential for performance
+- Edge-triggered mode requires careful handling
+- Event-driven design improves concurrency significantly
+
+---
+
+## Conclusion
+
+This minimal epoll server demonstrates how Linux efficiently handles high-performance network I/O.
+
+Future improvements could include:
+
+- HTTP protocol parsing
+- Thread pool integration
+- Load balancing
+- Connection pooling

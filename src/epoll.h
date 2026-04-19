@@ -6,5 +6,6 @@ int set_socket_opt(int sockfd);
 int bind_socket(int sockfd, int port);
 int listen_socket(int sockfd);
 int create_epoll_instance(void);
+int register_socket(int sockfd, int epoll_fd);
 
 #endif

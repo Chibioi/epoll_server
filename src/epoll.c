@@ -69,3 +69,18 @@ int create_epoll_instance(void) {
   }
   return epoll_fd;
 }
+
+int register_socket(int sockfd, int epoll_fd) {
+  // events specifies the data that the kernel should save and return when the
+  // corresponding file descriptor becomes ready
+  struct epoll_event event;
+  // EPOLLIN => The associated file is ready for read operations
+  event.events = EPOLLIN; // Monitor read events
+  event.data.fd = sockfd; // Store the FD for identification later
+  int epoll_ctrl_interface = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sockfd, &event);
+  if(epoll_ctrl_interface < 0) {
+    perror("epoll ctrl interface");
+      exit(1);
+  }
+  return epoll_ctrl_interface;
+}
