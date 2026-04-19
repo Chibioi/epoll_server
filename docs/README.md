@@ -6,6 +6,7 @@
 
 1. Language: C
 2. Operating System: Linux
+3. Testing framework: CUnit
 
 ## Libraries
 
