@@ -17,7 +17,9 @@
 
 struct sockaddr_in address;
 struct epoll_event event[MAX_EVENTS];
-socklen_t addresslen = sizeof(address);
+socklen_t addresslen =
+    sizeof(address); // socklen_t is used to get the length of a socket address
+                     // and other network related entities (at least 32 bits)
 
 typedef struct {
   char buf[BUF_SIZE];
@@ -26,6 +28,7 @@ typedef struct {
 
 write_buf_t write_buffers[MAX_CLIENTS];
 
+// Creating a socket
 int create_socket(void) {
   // AF_INET represents the address family for IPV4
   // SOCK_STREAM represents the type of socket connection(connection-oriented)
@@ -37,23 +40,32 @@ int create_socket(void) {
   return sockfd;
 }
 
+// Reusing a socket
 int set_socket_opt(int sockfd) {
   int option = 1;
   // SOL_SOCKET => setting socket level function rather than option-specific to
   // a particular protocol e.g TCP, IP. Allows local socket IP and port to be
   // reused even though a previous connection using that address is terminated
-  return setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
+  int res =
+      setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
+  if (res == -1) {
+    perror("set socket options failed");
+    exit(1);
+  }
+  return res;
 }
 
+// Setting the socket to non-blocking (Async) flag
 int setnonblocking(int sockfd) {
   int flags = fcntl(sockfd, F_GETFL, 0);
-  if (flags < 0) {
+  if (flags == -1) {
     perror("Non-block I/O failed");
     exit(1);
   };
   return fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 }
 
+// Binding the socket with the IP address and port number
 int bind_socket(int sockfd) {
   address.sin_family = AF_INET; // address family (IPV4)
   address.sin_port =
@@ -65,13 +77,14 @@ int bind_socket(int sockfd) {
     perror("binding failed");
     exit(1);
   }
-  setnonblocking(sockfd);
+  setnonblocking(sockfd); // set to a non-blocking state
   return bind_soc;
 }
 
+// passive listening by the socket with a max queue connection of 128
 int listen_socket(int sockfd) {
   // SOMAXCONN is the maximum queue connections you are allowed to listen()
-  int res = listen(sockfd, SOMAXCONN);
+  int res = listen(sockfd, SOMAXCONN); // SOMAXCONN == 128
   if (res < 0) {
     perror("listening failure");
     exit(1);
@@ -79,6 +92,7 @@ int listen_socket(int sockfd) {
   return res;
 }
 
+// create an epoll instance
 int create_epoll_instance(void) {
   int epoll_fd = epoll_create1(0);
   if (epoll_fd < 0) {
