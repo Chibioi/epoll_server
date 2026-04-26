@@ -1,3 +1,4 @@
+#include "epoll.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -11,20 +12,18 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define MAX_EVENTS 64
-#define BUF_SIZE 1024
-#define MAX_CLIENTS 1024
-
-struct sockaddr_in address;
-struct epoll_event event[MAX_EVENTS];
-socklen_t addresslen =
-    sizeof(address); // socklen_t is used to get the length of a socket address
-                     // and other network related entities (at least 32 bits)
-
-typedef struct {
-  char buf[BUF_SIZE];
-  size_t len;
-} write_buf_t;
+// #define MAX_EVENTS 64
+// #define BUF_SIZE 1024
+// #define MAX_CLIENTS 1024
+// //
+// // // struct sockaddr_in address;
+// // // struct epoll_event event[MAX_EVENTS];
+// //
+// // user defined data type for my write buffer
+// typedef struct {
+//   char buf[BUF_SIZE];
+//   size_t len;
+// } write_buf_t;
 
 write_buf_t write_buffers[MAX_CLIENTS];
 
@@ -67,6 +66,11 @@ int setnonblocking(int sockfd) {
 
 // Binding the socket with the IP address and port number
 int bind_socket(int sockfd) {
+  struct sockaddr_in address;
+  // socklen_t addresslen = sizeof(
+  //     address); // socklen_t is used to get the length of a socket address
+  // and other network related entities (at least 32 bits)
+
   address.sin_family = AF_INET; // address family (IPV4)
   address.sin_port =
       htons(8080); // solves the issue of byte ordering in the network
@@ -77,7 +81,10 @@ int bind_socket(int sockfd) {
     perror("binding failed");
     exit(1);
   }
-  setnonblocking(sockfd); // set to a non-blocking state
+  if (setnonblocking(sockfd) == -1) {
+    perror("set non-blocking");
+    exit(1);
+  } // set to a non-blocking state
   return bind_soc;
 }
 
@@ -102,48 +109,82 @@ int create_epoll_instance(void) {
   return epoll_fd;
 }
 
+// Read handler for connected client
 void do_use_fd(int fd, int epoll_fd) {
+  if (fd < 0 || fd >= MAX_CLIENTS) {
+    close(fd);
+    return;
+  }
+  // EPOLLET notifies you that data has arrived to the empty buffer
+  // Preparing an epoll event for later use whenever you want to rearm the fd.
   struct epoll_event ev = {.events = EPOLLIN | EPOLLET, .data.fd = fd};
   char buffer[BUF_SIZE];
   while (1) {
+    // read from the FD into the buffer
     ssize_t count = read(fd, buffer, sizeof(buffer));
     if (count == -1) {
       if (errno != EAGAIN && errno != EWOULDBLOCK) {
         perror("read error");
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+        write_buffers[fd].len = 0; // clear stale data
+        memset(write_buffers[fd].buf, 0, BUF_SIZE);
         close(fd); // clean up on error
       }
-      break; // No more data to read for now
-    } else if (count == 0) {
+      break;                 // No more data to read for now
+    } else if (count == 0) { // EOF
       printf("client disconnected on FD %d\n", fd);
+      epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+      write_buffers[fd].len = 0; // clear stale data
+      memset(write_buffers[fd].buf, 0, BUF_SIZE);
       close(fd);
       break;
     }
-    printf("Read %zd bytes", count);
+    printf("Read %zd bytes\n", count);
 
+    // Apends the bytes just read into a per fd write buffer
+    // space variable checks for overflow is the write buffer already have
+    // queued up bytes
+    // INTENT: An echo server. whatever the client sends, buffer it up to send
+    // it back.
     size_t space = BUF_SIZE - write_buffers[fd].len;
     size_t to_copy = (size_t)count < space ? (size_t)count : space;
+
     // Queue a response into the write buffer
     memcpy(write_buffers[fd].buf + write_buffers[fd].len, buffer, to_copy);
     write_buffers[fd].len += to_copy;
 
-    // Arm EPOLLOUT so we get notified when the socket is writable
+    // Arm EPOLLOUT so we get notified when the socket is writable.
+
+    // to re-arm means to update the event monitoring settings for an existing
+    // FD within an epoll instance to resume watching for I/O event after it has
+    // been triggered or modified.
     ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
     ev.data.fd = fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
   }
 }
 
+// Write handler - called when epoll fires EPOLLOUT
 void do_write_fd(int fd, int epoll_fd) {
+  if (fd < 0 || fd >= MAX_CLIENTS) {
+    close(fd);
+    return;
+  }
   struct epoll_event ev = {.events = EPOLLIN | EPOLLET, .data.fd = fd};
   write_buf_t *wb = &write_buffers[fd];
   size_t written = 0;
 
   while (written < wb->len) {
     ssize_t n = write(fd, wb->buf + written, wb->len - written);
+    // wb->buf + written advances the pointer past already-sent bytes each
+    // iteration, so you never resend data.
     if (n == -1) {
       if (errno == EAGAIN || errno == EWOULDBLOCK)
         break; // socket full, retry later
       perror("write error");
+      epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+      write_buffers[fd].len = 0; // clear stale data
+      memset(write_buffers[fd].buf, 0, BUF_SIZE);
       close(fd);
       return;
     }
@@ -157,20 +198,25 @@ void do_write_fd(int fd, int epoll_fd) {
 
   // If buffer is fully drained, disarm EPOLLOUT to avoid busy-looping
   if (wb->len == 0) {
-    struct epoll_event ev = {.events = EPOLLIN | EPOLLET, .data.fd = fd};
     epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
   }
 }
 
 void register_socket(int epoll_fd) {
+  struct epoll_event event[MAX_EVENTS];
+  struct sockaddr_in address;
+  socklen_t addresslen = sizeof(address);
   // events specifies the data that the kernel should save and return when the
   // corresponding file descriptor becomes ready
   // EPOLLIN => The associated file is ready for read operations
 
+  // Boot strap the TCP server
   int sockfd = create_socket();
   set_socket_opt(sockfd);
   bind_socket(sockfd);
   listen_socket(sockfd);
+
+  // Registers listening socket with epoll.
   struct epoll_event ev = {.events = EPOLLIN | EPOLLET, .data.fd = sockfd};
   int epoll_ctrl_interface = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sockfd, &ev);
   if (epoll_ctrl_interface < 0) {
@@ -178,16 +224,21 @@ void register_socket(int epoll_fd) {
     exit(1);
   }
 
+  // Blocks until at least one FD is ready.
   while (1) {
     int nfds = epoll_wait(epoll_fd, event, MAX_EVENTS, -1);
+    // nfds returns how many events came back which would be stored in the
+    // global event[] array. This is the only blocking call in the whole server.
     if (nfds < 0) {
       perror("nfds");
       exit(1);
     }
     for (int i = 0; i < nfds; i++) {
+      // checks if this a listening socket for each ready event
       if (event[i].data.fd == sockfd) {
         // Handle connection
         while (1) {
+          addresslen = sizeof(address); // reset before each accept.
           int conn_sock =
               accept(sockfd, (struct sockaddr *)&address, &addresslen);
           if (conn_sock == -1) {
@@ -196,15 +247,35 @@ void register_socket(int epoll_fd) {
             perror("accept");
             exit(1);
           }
-          setnonblocking(conn_sock);
-          struct epoll_event conn_ev = {.events = EPOLLIN | EPOLLET,
-                                        .data.fd = conn_sock};
-          if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn_sock, &ev) == -1) {
+          // client must be non-blocking or the read/write handler fails
+          if (setnonblocking(conn_sock) == -1) {
+            perror("set non-blocking");
+            close(conn_sock);
+            continue;
+          }
+          struct epoll_event conn_ev = {
+              .events = EPOLLIN | EPOLLET | EPOLLRDHUP, .data.fd = conn_sock};
+          // registers the new client FD so that epoll watches it for future
+          // data.
+          if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn_sock, &conn_ev) == -1) {
             perror("epoll_ctl: conn_sock");
             exit(1);
           }
         }
-      } else {
+      }
+      // This fd is an existing client. Dispatch to the appropriate handler
+      // based on what's ready.
+      else {
+        if (event[i].events & EPOLLRDHUP) {
+          int fd = event[i].data.fd;
+          epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+          if (fd >= 0 && fd < MAX_CLIENTS) {
+            write_buffers[fd].len = 0;
+            memset(write_buffers[fd].buf, 0, BUF_SIZE);
+          }
+          close(fd);
+          continue;
+        }
         if (event[i].events & EPOLLIN) {
           do_use_fd(event[i].data.fd, epoll_fd);
         }

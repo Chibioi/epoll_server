@@ -1,28 +1,71 @@
-CC      = gcc
-CFLAGS  = -Wall -Wextra -g
-LDFLAGS = -lcunit
-SRC     = epoll.c
+# ── Makefile ────────────────────────────────────────────────────────────────
+#
+# Layout expected:
+#   src/epoll.h   src/epoll.c   src/main.c
+#   tests/tests.c
+#
+# Targets:
+#   make          → build the server binary  (default)
+#   make test     → build & run the CUnit test suite
+#   make run      → build & start the server
+#   make clean    → remove all build artefacts
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Automatically find all test source files and derive binary names from them
-TEST_SRCS := $(wildcard tests/test_*.c)
-TESTS     := $(TEST_SRCS:.c=)
+CC      := gcc
+CFLAGS  := -Wall -Wextra -pedantic -std=c11
+LDFLAGS :=
+LIBS    := -lcunit
 
-all: $(TESTS)
+BUILD   := build
+SRC_DIR := src
+TST_DIR := tests
 
-# Pattern rule — applies to every tests/test_* binary
-tests/%: tests/%.c $(SRC)
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+# ── artefact names ───────────────────────────────────────────────────────────
+SERVER  := $(BUILD)/server
+TEST_BIN:= $(BUILD)/test_runner
 
-# Run all test binaries in one shot
-run: all
-	@for t in $(TESTS); do \
-		echo "=============================="; \
-		echo " Running: $$t"; \
-		echo "=============================="; \
-		./$$t || exit 1; \
-	done
-	@echo ""
-	@echo "All test suites passed!"
+# ── source lists ─────────────────────────────────────────────────────────────
+SRV_SRCS := $(SRC_DIR)/epoll.c $(SRC_DIR)/main.c
+TST_SRCS := $(TST_DIR)/tests.c $(SRC_DIR)/epoll.c   # no main.c — tests supply their own main
 
+# ── default target ────────────────────────────────────────────────────────────
+.PHONY: all
+all: $(SERVER)
+
+# ── build the server ─────────────────────────────────────────────────────────
+$(SERVER): $(SRV_SRCS) $(SRC_DIR)/epoll.h | $(BUILD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRV_SRCS)
+	@echo "Built $@"
+
+# ── build & run the test suite ───────────────────────────────────────────────
+.PHONY: test
+test: $(TEST_BIN)
+	@echo "Running tests..."
+	@./$(TEST_BIN); \
+	  STATUS=$$?; \
+	  if [ $$STATUS -eq 0 ]; then \
+	    echo "All tests passed."; \
+	  else \
+	    echo "Tests FAILED (exit $$STATUS)."; \
+	  fi; \
+	  exit $$STATUS
+
+$(TEST_BIN): $(TST_SRCS) $(SRC_DIR)/epoll.h | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $(TST_SRCS) $(LIBS)
+	@echo "Built $@"
+
+# ── run the server (builds first) ────────────────────────────────────────────
+.PHONY: run
+run: $(SERVER)
+	@echo "Starting server..."
+	./$(SERVER)
+
+# ── create build directory ────────────────────────────────────────────────────
+$(BUILD):
+	mkdir -p $(BUILD)
+
+# ── clean ─────────────────────────────────────────────────────────────────────
+.PHONY: clean
 clean:
-	rm -f $(TESTS)
+	rm -rf $(BUILD)
+	@echo "Cleaned."
