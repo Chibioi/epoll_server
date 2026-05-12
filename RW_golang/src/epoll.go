@@ -140,7 +140,7 @@ func CloseClient(epoll_fd, fd int) {
 	RemoveFromEpoll(epoll_fd, fd)
 	connMapMu.Lock()
 	conn, ok := connMap[fd] // CHECK THIS LATER
-	if !ok {
+	if ok {
 		conn.Close()
 		delete(connMap, fd)
 	}
