@@ -307,7 +307,8 @@ func TestAcceptAll_AcceptsConnections(t *testing.T) {
 	defer unix.Close(listenFd)
 
 	efd := newEpoll(t)
-	if err := epoll.AddToEpoll(efd, listenFd); err != nil {
+	err = epoll.AddToEpoll(efd, listenFd)
+	if err != nil {
 		t.Fatalf("AddToEpoll: %v", err)
 	}
 
