@@ -1,4 +1,4 @@
-package main
+package epoll
 
 import (
 	"errors"
@@ -17,8 +17,8 @@ const (
 )
 
 var (
-	connMap   = make(map[int]net.Conn)
-	connMapMu sync.Mutex
+	ConnMap   = make(map[int]net.Conn)
+	ConnMapMu sync.Mutex
 )
 
 // we want to extract the file descriptor using this function
@@ -82,26 +82,26 @@ func AcceptAll(epoll_fd, listen_fd int) {
 		}
 		// Reconstruct a net.Conn from the raw FD so we can use Go's
 		// higher-level I/O helpers (bufio, RemoteAddr, etc.).
-		clientConn, err := fdToNetConn(conn_fd) // COME BACK TO THIS
+		clientConn, err := FdToNetConn(conn_fd) // COME BACK TO THIS
 		if err != nil {
 			log.Printf("fdToNetConn: %v", err)
 			unix.Close(conn_fd)
 			continue
 		}
-		connMapMu.Lock()              // locks mutex
-		connMap[conn_fd] = clientConn // maps FDs to the its relative connection endpoint
-		connMapMu.Unlock()            // unlocks mutex
+		ConnMapMu.Lock()              // locks mutex
+		ConnMap[conn_fd] = clientConn // maps FDs to the its relative connection endpoint
+		ConnMapMu.Unlock()            // unlocks mutex
 
 		err = AddToEpoll(epoll_fd, conn_fd)
 		if err != nil {
 			log.Printf("AddToEpoll(client): %v", err)
 			clientConn.Close() // close the connection FD
-			connMapMu.Lock()
-			delete(connMap, conn_fd) // delete an element with a valid key in the hash table
-			connMapMu.Unlock()
+			ConnMapMu.Lock()
+			delete(ConnMap, conn_fd) // delete an element with a valid key in the hash table
+			ConnMapMu.Unlock()
 			continue
 		}
-		addr := addrFromSockaddr(sa)
+		addr := AddrFromSockaddr(sa)
 		fmt.Printf("[+] New connection from %s (fd=%d)\n", addr, conn_fd)
 
 		// Send a greeting immediately.
@@ -135,16 +135,16 @@ func ReadAll(epoll_fd, fd int) {
 	}
 }
 
-// CloseClient removes fd from epoll, closes the net.Conn (if any) and cleans up the connMap
+// CloseClient removes fd from epoll, closes the net.Conn (if any) and cleans up the ConnMap
 func CloseClient(epoll_fd, fd int) {
 	RemoveFromEpoll(epoll_fd, fd)
-	connMapMu.Lock()
-	conn, ok := connMap[fd] // CHECK THIS LATER
+	ConnMapMu.Lock()
+	conn, ok := ConnMap[fd] // CHECK THIS LATER
 	if ok {
 		conn.Close()
-		delete(connMap, fd)
+		delete(ConnMap, fd)
 	}
-	connMapMu.Unlock()
+	ConnMapMu.Unlock()
 }
 
 // Main event loop
@@ -237,7 +237,7 @@ func RunClient() {
 }
 
 // Type assert from fd to NetConn
-func fdToNetConn(fd int) (net.Conn, error) {
+func FdToNetConn(fd int) (net.Conn, error) {
 	f := os.NewFile(uintptr(fd), fmt.Sprintf("tcp-conn-%d", fd))
 	if f == nil {
 		return nil, fmt.Errorf("os.NewFile returned nil for fd=%d", fd)
@@ -251,7 +251,7 @@ func fdToNetConn(fd int) (net.Conn, error) {
 }
 
 // Get the address type from the socket address
-func addrFromSockaddr(sa unix.Sockaddr) string {
+func AddrFromSockaddr(sa unix.Sockaddr) string {
 	switch v := sa.(type) {
 	case *unix.SockaddrInet4:
 		return fmt.Sprintf("%d.%d.%d.%d:%d", v.Addr[0], v.Addr[1], v.Addr[2], v.Addr[3], v.Port)
