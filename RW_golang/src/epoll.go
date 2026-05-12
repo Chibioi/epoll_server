@@ -1,11 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"sync"
 
 	"golang.org/x/sys/unix"
@@ -109,59 +109,155 @@ func AcceptAll(epoll_fd, listen_fd int) {
 	}
 }
 
-func Epoll_instance() {
-	// creating an epoll instance
+func ReadAll(epoll_fd, fd int) {
+	// create a byte slice of 4096 bytes
+	buf := make([]byte, 4096)
+	for {
+		n, err := unix.Read(fd, buf)
+		if err != nil {
+			if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+				return // drained
+			}
+			// Real error or EOF => Close the connection
+			log.Printf("Real error on fd=%d: %v - closing", fd, err)
+			CloseClient(epoll_fd, fd)
+			return
+		}
+		if n == 0 {
+			// EOF: Peer closed the connection.
+			fmt.Printf("Connection closed on the FD %d\n", fd)
+			CloseClient(epoll_fd, fd)
+			return
+		}
+		fmt.Printf("FD %d received %d bytes: %s\n", fd, n, buf[:n])
+		// Echo back to the client
+		unix.Write(fd, buf[:n])
+	}
+}
+
+// CloseClient removes fd from epoll, closes the net.Conn (if any) and cleans up the connMap
+func CloseClient(epoll_fd, fd int) {
+	RemoveFromEpoll(epoll_fd, fd)
+	connMapMu.Lock()
+	conn, ok := connMap[fd] // CHECK THIS LATER
+	if !ok {
+		conn.Close()
+		delete(connMap, fd)
+	}
+	connMapMu.Unlock()
+}
+
+// Main event loop
+func RunEpollServer() {
+	ln, err := net.Listen("tcp", listen_port)
+	if err != nil {
+		log.Fatalf("Lisetning error: %v\n", err)
+	}
+	defer ln.Close()
+
+	// Get listener FD
+	listen_fd, err := Get_raw_fd(ln)
+	if err != nil {
+		log.Fatalf("Get_Raw_Fd: %v\n", err)
+	}
+
 	epoll_fd, err := unix.EpollCreate1(0)
 	if err != nil {
-		panic(err)
+		log.Fatalf("EpollCreate1: %v\n", err)
 	}
+	// Close the epoll instance before function goes out of scope
 	defer unix.Close(epoll_fd)
-
-	// prepare a listening socket
-	ln, err := net.Listen("tcp", ":8080")
+	// Add to the Epoll instance
+	err = AddToEpoll(epoll_fd, listen_fd)
 	if err != nil {
-		panic(err)
+		log.Fatalf("AddToEpoll(listen): %v\n", err)
 	}
+	fmt.Printf("epoll server listening on %s\n", listen_port)
 
-	// get the FD of the listening socket
-	fd, err := Get_raw_fd(ln)
-	if err != nil {
-		panic(err)
-	}
-
-	// Register FD with Epoll
-	// We listen for EPOLLIN (available to read) and use Edge-Triggered (EPOLLET) mode
-	ev := &unix.EpollEvent{
-		Events: unix.EPOLLIN | unix.EPOLLET, // readiness for incoming connections and of edge triggered type
-		Fd:     int32(fd),
-	}
-
-	// Add an event to the epoll
-	err = unix.EpollCtl(epoll_fd, unix.EPOLL_CTL_ADD, fd, ev)
-	if err != nil {
-		panic(err)
-	}
-	// The event loop
-	events := make([]unix.EpollEvent, 10)
+	// Buffer size for 128 events
+	events := make([]unix.EpollEvent, max_events)
 	for {
-		// wait for events (blocks until something happen)
-		no_of_events, err := unix.EpollWait(epoll_fd, events, -1)
+		_, err := unix.EpollWait(epoll_fd, events, -1)
 		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				// Interrupted by signal - just retry
+				continue
+			}
+			log.Printf("EpollWait error: %v\n", err)
 			continue
 		}
-		for i := 0; i < no_of_events; i++ {
-			if int(events[i].Fd) == fd {
-				fmt.Println("New connection to the server socket")
-				conn_fd, _, err := unix.Accept(fd)
-				if err != nil {
-					if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
-						break // drained, stop looping
-					}
-					fmt.Println("Accept error:", err)
-					break
+
+		for _, ev := range events {
+			fd := int(ev.Fd)
+
+			// Handle errors or hang-up events first
+			if ev.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
+				log.Printf("EPOLLERR/EPOLLHUP on fd=%d — closing", fd)
+				if fd == listen_fd {
+					log.Fatal("Error on listening socket — exiting")
 				}
+				CloseClient(epoll_fd, fd)
+				continue
+			}
+
+			if fd == listen_fd {
+				// accept connection
+				AcceptAll(epoll_fd, listen_fd)
+			} else {
+				// data available on a client FD
+				ReadAll(epoll_fd, fd)
 			}
 		}
 	}
+}
 
+// Minimal test client
+func RunClient() {
+	conn, err := net.Dial("tcp", "127.0.0.1:"+listen_port)
+	if err != nil {
+		log.Fatalf("Dial: %v\n", err)
+	}
+
+	defer conn.Close()
+
+	// buffer of size 64
+	buf := make([]byte, 64)
+	// Read from the connection into the buffer
+	n, err := conn.Read(buf)
+	if err != nil {
+		log.Printf("Read: %v", err)
+		return
+	}
+	fmt.Printf("Message from server: %s\n", buf[:n])
+
+	// Write something back to the echo path
+	if _, err := conn.Write([]byte("Ping\n")); err != nil {
+		log.Printf("Write: %v", err)
+	}
+}
+
+// Type assert from fd to NetConn
+func fdToNetConn(fd int) (net.Conn, error) {
+	f := os.NewFile(uintptr(fd), fmt.Sprintf("tcp-conn-%d", fd))
+	if f == nil {
+		return nil, fmt.Errorf("os.NewFile returned nil for fd=%d", fd)
+	}
+	conn, err := net.FileConn(f)
+	f.Close() // FileConn dups fd internally; close the wrapper
+	if err != nil {
+		return nil, fmt.Errorf("net.FileConn: %w", err)
+	}
+	return conn, nil
+}
+
+// Get the address type from the socket address
+func addrFromSockaddr(sa unix.Sockaddr) string {
+	switch v := sa.(type) {
+	case *unix.SockaddrInet4:
+		return fmt.Sprintf("%d.%d.%d.%d:%d", v.Addr[0], v.Addr[1], v.Addr[2], v.Addr[3], v.Port)
+	case *unix.SockaddrInet6:
+		return fmt.Sprintf("[%v]:%d", v.Addr, v.Port)
+	default:
+		return "unknown"
+	}
 }
