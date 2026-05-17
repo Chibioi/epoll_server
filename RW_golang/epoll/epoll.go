@@ -34,8 +34,11 @@ func Get_raw_fd(Listen net.Listener) (int, error) {
 	}
 	defer file.Close() // close wrapper to prevent FD leak
 
-	// get the raw integer descriptor
-	fd := int(file.Fd())
+	// get the raw integer descriptor and duplicates the fd so it stays alive after file.Close()
+	fd, err := unix.Dup(int(file.Fd()))
+	if err != nil {
+		return 0, fmt.Errorf("unix.Dup: %w", err)
+	}
 	// set it to non-blocking to use for epoll
 	err = unix.SetNonblock(fd, true)
 	if err != nil {
