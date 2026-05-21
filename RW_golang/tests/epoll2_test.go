@@ -16,7 +16,7 @@ func newEpollFd(t *testing.T) int {
 	if err != nil {
 		t.Fatalf("EpollCreate1: %v", err)
 	}
-	t.Cleanup(func() { unix.Close(epfd) })
+	t.Cleanup(func() { unix.Close(epfd) }) // helps to cleanup the epoll FD to prevent memory leaks
 	return epfd
 }
 
@@ -24,12 +24,12 @@ func newEpollFd(t *testing.T) int {
 // and registers both ends for cleanup.
 func newPipe(t *testing.T) int {
 	t.Helper()
-	r, w, err := os.Pipe()
+	r, w, err := os.Pipe() // os.Pipe() create a connected pair of files used for IPC or communication btw goroutines
 	if err != nil {
 		t.Fatalf("os.Pipe: %v", err)
 	}
-	t.Cleanup(func() { r.Close(); w.Close() })
-	return int(r.Fd())
+	t.Cleanup(func() { r.Close(); w.Close() }) // close the files r and w
+	return int(r.Fd())                         // returns the FD of the file "r"
 }
 
 // TestAddToEpoll_Success verifies that a valid fd is registered without error.
@@ -77,7 +77,7 @@ func TestAddToEpoll_EventIsTriggered(t *testing.T) {
 	defer r.Close()
 	defer w.Close()
 
-	rfd := int(r.Fd())
+	rfd := int(r.Fd()) // get the FD of the read end of the pipe
 	if err := epoll.AddToEpoll(epfd, rfd); err != nil {
 		t.Fatalf("AddToEpoll: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestAddToEpoll_EventIsTriggered(t *testing.T) {
 	}
 
 	events := make([]unix.EpollEvent, 4)
-	n, err := unix.EpollWait(epfd, events, 100 /*ms*/)
+	n, err := unix.EpollWait(epfd, events, 100) // 100 signifies 100ms
 	if err != nil {
 		t.Fatalf("EpollWait: %v", err)
 	}
@@ -126,22 +126,24 @@ func TestAddToEpoll_InvalidTargetFd(t *testing.T) {
 }
 
 // TestAddToEpoll_SocketFd verifies that a socket fd (not just a pipe) works.
+// Helps to know that the epoll wrapper can register a standard socket FD and not only just a simple file or pipe
 func TestAddToEpoll_SocketFd(t *testing.T) {
 	epfd := newEpollFd(t)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0") // tcp listener is local to this function scope
 	if err != nil {
 		t.Fatalf("net.Listen: %v", err)
 	}
 	defer ln.Close()
 
 	tcpLn := ln.(*net.TCPListener)
-	rawConn, err := tcpLn.SyscallConn()
+	rawConn, err := tcpLn.SyscallConn() // helps the develper execute raw syscalls on an active network connection without interfering with go's runtime network poller
 	if err != nil {
 		t.Fatalf("SyscallConn: %v", err)
 	}
 
 	var addErr error
+	// This ensures that the FD is stable across the callback function in rawConn.Control() and is not modified by the Go's garbage collector
 	controlErr := rawConn.Control(func(fd uintptr) {
 		addErr = epoll.AddToEpoll(epfd, int(fd))
 	})
@@ -164,8 +166,7 @@ func TestAddToEpoll_ClosedFd(t *testing.T) {
 	fd := int(r.Fd())
 	r.Close() // close before registering
 
-	err = epoll.AddToEpoll(epfd, fd)
-	if err == nil {
+	if err := epoll.AddToEpoll(epfd, fd); err == nil {
 		t.Fatal("expected error for closed fd, got nil")
 	}
 }

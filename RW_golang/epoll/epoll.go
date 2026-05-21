@@ -154,7 +154,7 @@ func CloseClient(epoll_fd, fd int) {
 func RunEpollServer() {
 	ln, err := net.Listen("tcp", listen_port)
 	if err != nil {
-		log.Fatalf("Lisetning error: %v\n", err)
+		log.Fatalf("Listening error: %v\n", err)
 	}
 	defer ln.Close()
 
