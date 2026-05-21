@@ -7,13 +7,22 @@ import (
 	"testing"
 )
 
-func TestRemoveFromEpoll(t *testing.T) {
-	// Create an epoll instance
-	epollFd, err := unix.EpollCreate1(0)
+func new_epoll(t *testing.T) (int, error) {
+	t.Helper()
+	epoll_fd, err := unix.EpollCreate1(0)
 	if err != nil {
 		t.Fatalf("failed to create epoll: %v", err)
 	}
-	defer unix.Close(epollFd)
+	t.Cleanup(func() { defer unix.Close(epoll_fd) })
+	return epoll_fd, nil
+}
+
+func TestRemoveFromEpoll(t *testing.T) {
+	// Create an epoll instance
+	epollFd, err := new_epoll(t)
+	if err != nil {
+		t.Fatalf("failed to create epoll: %v", err)
+	}
 
 	// Create a real file descriptor using a pipe
 	r, w, err := os.Pipe()
@@ -22,7 +31,7 @@ func TestRemoveFromEpoll(t *testing.T) {
 	}
 	defer w.Close() // only close write end; read end is managed by RemoveFromEpoll
 
-	fd := int(r.Fd())
+	fd := int(r.Fd()) // explicitly type coerce the file descriptor from uintptr to int
 
 	// Register the FD with epoll before removing it
 	event := &unix.EpollEvent{
@@ -33,9 +42,8 @@ func TestRemoveFromEpoll(t *testing.T) {
 		t.Fatalf("failed to add fd to epoll: %v", err)
 	}
 
-	// Verify the FD is registered (adding it again should fail with EEXIST)
-	err = unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, fd, event)
-	if err != unix.EEXIST {
+	// Verify the FD is registered (adding it again should fail with EEXIST) to avoid duplicate FDs in the epoll instance
+	if err := unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, fd, event); err != unix.EEXIST {
 		t.Fatalf("expected EEXIST before removal, got: %v", err)
 	}
 
@@ -43,9 +51,8 @@ func TestRemoveFromEpoll(t *testing.T) {
 	epoll.RemoveFromEpoll(epollFd, fd)
 
 	// Verify FD is deregistered: adding it again should now fail with EBADF (fd is closed)
-	// or succeed if the fd number was reused — but since we just closed it, EBADF is expected
-	err = unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, fd, event)
-	if err != unix.EBADF {
+	// or succeed if the fd number was reused — but since we just closed it, EBADF(Bad file descriptor) is expected
+	if err := unix.EpollCtl(epollFd, unix.EPOLL_CTL_ADD, fd, event); err != unix.EBADF {
 		t.Errorf("expected EBADF after RemoveFromEpoll (fd should be closed), got: %v", err)
 	}
 
