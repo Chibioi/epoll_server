@@ -13,7 +13,7 @@ import (
 
 const (
 	max_events  = 128
-	listen_port = ":8080"
+	listen_port = ":2551"
 )
 
 var (
@@ -50,11 +50,11 @@ func Get_raw_fd(Listen net.Listener) (int, error) {
 
 // AddToEpoll() registers FDs to edge-triggered read events
 func AddToEpoll(epoll_fd, fd int) error {
-	ev := unix.EpollEvent{
+	ev := &unix.EpollEvent{
 		Events: unix.EPOLLIN | unix.EPOLLET, // edge-triggered read
 		Fd:     int32(fd),
 	}
-	return unix.EpollCtl(epoll_fd, unix.EPOLL_CTL_ADD, fd, &ev)
+	return unix.EpollCtl(epoll_fd, unix.EPOLL_CTL_ADD, fd, ev)
 }
 
 // RemoveFromEpoll() deregisters FDs and closes it
@@ -77,38 +77,49 @@ func AcceptAll(epoll_fd, listen_fd int) {
 			return
 		}
 		// Make the client FD non-blocking too.
-		err = unix.SetNonblock(conn_fd, true)
-		if err != nil {
+		if err := unix.SetNonblock(conn_fd, true); err != nil {
 			log.Printf("SetNonblock(connFd): %v", err)
 			unix.Close(conn_fd)
 			continue
 		}
 		// Reconstruct a net.Conn from the raw FD so we can use Go's
 		// higher-level I/O helpers (bufio, RemoteAddr, etc.).
-		clientConn, err := FdToNetConn(conn_fd) // COME BACK TO THIS
+		clientConn, err := FdToNetConn(conn_fd) // returns a datatype of net.Conn
 		if err != nil {
 			log.Printf("fdToNetConn: %v", err)
 			unix.Close(conn_fd)
 			continue
 		}
+
+		rawConn, err := clientConn.(*net.TCPConn).SyscallConn()
+		if err != nil {
+			clientConn.Close()
+			// fmt.Errorf("Error moving from generic net.Conn to net.TCPConn: %v", err)
+			panic(err)
+		}
+		var innerFd int
+		rawConn.Control(func(fd uintptr) {
+			innerFd = int(fd)
+		})
+
+		unix.Close(conn_fd)
 		ConnMapMu.Lock()              // locks mutex
-		ConnMap[conn_fd] = clientConn // maps FDs to the its relative connection endpoint
+		ConnMap[innerFd] = clientConn // maps FDs to the its relative connection endpoint
 		ConnMapMu.Unlock()            // unlocks mutex
 
-		err = AddToEpoll(epoll_fd, conn_fd)
-		if err != nil {
+		if err := AddToEpoll(epoll_fd, innerFd); err != nil {
 			log.Printf("AddToEpoll(client): %v", err)
 			clientConn.Close() // close the connection FD
 			ConnMapMu.Lock()
-			delete(ConnMap, conn_fd) // delete an element with a valid key in the hash table
+			delete(ConnMap, innerFd) // delete an element with a valid key in the hash table
 			ConnMapMu.Unlock()
 			continue
 		}
 		addr := AddrFromSockaddr(sa)
-		fmt.Printf("[+] New connection from %s (fd=%d)\n", addr, conn_fd)
+		fmt.Printf("[+] New connection from %s (fd=%d)\n", addr, innerFd)
 
 		// Send a greeting immediately.
-		unix.Write(conn_fd, []byte("Hello from the epoll server!\n")) //nolint:errcheck
+		unix.Write(innerFd, []byte("Hello from the epoll server!\n")) //nolint:errcheck
 	}
 }
 
