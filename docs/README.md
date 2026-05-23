@@ -55,7 +55,7 @@ The server consists of the following components:
 
 This is the server's main socket responsible for accepting new connections.
 
-1. Created using `net.Listen("tcp", ":8080")`
+1. Created using `net.Listen("tcp", ":2551")`
 2. The raw file descriptor is extracted using `Get_raw_fd()`
 3. Set to non-blocking mode via `unix.SetNonblock()`
 4. Accepts incoming client connections at the syscall level with `unix.Accept()`
@@ -255,7 +255,7 @@ func CloseClient(epoll_fd, fd int) {
 
 ## How the Server Works
 
-1. Call `net.Listen("tcp", ":8080")` to create the listening socket
+1. Call `net.Listen("tcp", ":2551")` to create the listening socket
 2. Extract the raw FD with `Get_raw_fd()`
 3. Create an epoll instance with `unix.EpollCreate1(0)`
 4. Register the listening FD with `AddToEpoll()`
@@ -288,7 +288,7 @@ cd RW_golang
 go run main/main.go
 ```
 
-The server listens on `:8080` and logs new connections and received data to stdout.
+The server listens on `:2551` and logs new connections and received data to stdout.
 
 ---
 
