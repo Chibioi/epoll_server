@@ -16,8 +16,15 @@ const (
 	listen_port = ":2551"
 )
 
+type Conn struct {
+	fd       int
+	netConn  net.Conn
+	readBuf  []byte // accumulated incoming bytes
+	writeBuf []byte // bytes waiting to be flushed
+}
+
 var (
-	ConnMap   = make(map[int]net.Conn)
+	ConnMap   = make(map[int]*Conn)
 	ConnMapMu sync.Mutex
 )
 
@@ -58,9 +65,14 @@ func AddToEpoll(epoll_fd, fd int) error {
 }
 
 // RemoveFromEpoll() deregisters FDs and closes it
-func RemoveFromEpoll(epoll_fd, fd int) {
-	unix.EpollCtl(epoll_fd, unix.EPOLL_CTL_DEL, fd, nil) //nolint:errcheck
-	unix.Close(fd)
+func RemoveFromEpoll(epoll_fd, fd int) error {
+	if err := unix.EpollCtl(epoll_fd, unix.EPOLL_CTL_DEL, fd, nil); err != nil {
+		if !errors.Is(err, unix.EBADF) && !errors.Is(err, unix.ENOENT) {
+			log.Printf("EpollCtl DEL fd=%d: %v", fd, err)
+		}
+		return err
+	}
+	return nil
 }
 
 // This drains all pending connections on the listening FD
@@ -103,9 +115,12 @@ func AcceptAll(epoll_fd, listen_fd int) {
 		})
 
 		unix.Close(conn_fd)
-		ConnMapMu.Lock()              // locks mutex
-		ConnMap[innerFd] = clientConn // maps FDs to the its relative connection endpoint
-		ConnMapMu.Unlock()            // unlocks mutex
+		ConnMapMu.Lock() // locks mutex
+		ConnMap[innerFd] = &Conn{
+			fd:      innerFd,
+			netConn: clientConn,
+		} // maps FDs to the its relative connection endpoint
+		ConnMapMu.Unlock() // unlocks mutex
 
 		if err := AddToEpoll(epoll_fd, innerFd); err != nil {
 			log.Printf("AddToEpoll(client): %v", err)
@@ -119,7 +134,9 @@ func AcceptAll(epoll_fd, listen_fd int) {
 		fmt.Printf("[+] New connection from %s (fd=%d)\n", addr, innerFd)
 
 		// Send a greeting immediately.
-		unix.Write(innerFd, []byte("Hello from the epoll server!\n")) //nolint:errcheck
+		if err := WriteAll(innerFd, []byte("Hello from the epoll server!\n")); err != nil {
+			log.Printf("WriteAll greeting fd=%d: %v", innerFd, err)
+		}
 	}
 }
 
@@ -145,7 +162,9 @@ func ReadAll(epoll_fd, fd int) {
 		}
 		fmt.Printf("FD %d received %d bytes: %s\n", fd, n, buf[:n])
 		// Echo back to the client
-		unix.Write(fd, buf[:n])
+		if err := WriteAll(fd, buf[:n]); err != nil {
+			log.Printf("WriteAll echo fd=%d: %v", fd, err)
+		}
 	}
 }
 
@@ -153,12 +172,20 @@ func ReadAll(epoll_fd, fd int) {
 func CloseClient(epoll_fd, fd int) {
 	RemoveFromEpoll(epoll_fd, fd)
 	ConnMapMu.Lock()
-	conn, ok := ConnMap[fd] // CHECK THIS LATER
-	if ok {
-		conn.Close()
-		delete(ConnMap, fd)
+	c, ok := ConnMap[fd] // CHECK THIS LATER
+	if !ok {
+		ConnMapMu.Unlock()
+		return
 	}
+	delete(ConnMap, fd)
 	ConnMapMu.Unlock()
+	// 1. Deregister from epoll first — stops new events firing on this fd
+	RemoveFromEpoll(epoll_fd, fd)
+
+	// 2. Close through net.Conn — this closes the dup'd fd that net.Conn owns
+	c.netConn.Close()
+
+	fmt.Printf("[-] Closed connection fd=%d\n", fd)
 }
 
 // Main event loop
@@ -191,7 +218,7 @@ func RunEpollServer() {
 	// Buffer size for 128 events
 	events := make([]unix.EpollEvent, max_events)
 	for {
-		_, err := unix.EpollWait(epoll_fd, events, -1)
+		n, err := unix.EpollWait(epoll_fd, events, -1)
 		if err != nil {
 			if errors.Is(err, unix.EINTR) {
 				// Interrupted by signal - just retry
@@ -201,7 +228,7 @@ func RunEpollServer() {
 			continue
 		}
 
-		for _, ev := range events {
+		for _, ev := range events[:n] { // only process events that fired
 			fd := int(ev.Fd)
 
 			// Handle errors or hang-up events first
@@ -227,7 +254,7 @@ func RunEpollServer() {
 
 // Minimal test client
 func RunClient() {
-	conn, err := net.Dial("tcp", "127.0.0.1:"+listen_port)
+	conn, err := net.Dial("tcp", "127.0.0.1:2551")
 	if err != nil {
 		log.Fatalf("Dial: %v\n", err)
 	}
@@ -274,4 +301,38 @@ func AddrFromSockaddr(sa unix.Sockaddr) string {
 	default:
 		return "unknown"
 	}
+}
+
+func WriteAll(fd int, data []byte) error {
+	var epoll_fd int
+	for len(data) > 0 {
+		n, err := unix.Write(fd, data)
+		if err != nil {
+			if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+				// FD not ready — store remainder in per-conn write buffer
+				// and re-arm EPOLLOUT so epoll tells you when to resume
+				ConnMapMu.Lock()
+				c, ok := ConnMap[fd]
+				if ok {
+					c.writeBuf = append(c.writeBuf, data...) // append to the end of the c.writeBuf slice
+				}
+				ConnMapMu.Unlock()
+				// re-arm epoll with EPOLLOUT so we know when fd is writable again
+				ev := &unix.EpollEvent{
+					Events: unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLET,
+					Fd:     int32(fd),
+				}
+				unix.EpollCtl(epoll_fd, unix.EPOLL_CTL_MOD, fd, ev)
+				return nil
+			}
+			if errors.Is(err, unix.EINTR) {
+				// interrupted by signal before anything was written
+				// just retry the same slice from the same position
+				continue
+			}
+			return err
+		}
+		data = data[n:] // continue from where it last stop writing
+	}
+	return nil
 }
