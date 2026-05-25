@@ -24,18 +24,18 @@ It allows a single goroutine to monitor thousands of client connections (file de
 
 ```
 .
-├── docs
-│   └── README.md
+├── README.md
 └── RW_golang
     ├── epoll
     │   └── epoll.go        # Core epoll server logic
     ├── go.mod
     ├── go.sum
-    ├── main
-    │   ├── main
-    │   └── main.go         # Entrypoint
+    ├── main.go             # Entrypoint
     └── tests
-        └── epoll1_test.go  # Unit tests
+        ├── epoll1_test.go  # Get_raw_fd tests
+        ├── epoll2_test.go  # AddToEpoll tests
+        ├── epoll3_test.go  # RemoveFromEpoll tests
+        └── epoll4_test.go  # FdToNetConn tests
 ```
 
 ## System Design
@@ -47,6 +47,7 @@ The server consists of the following components:
 - Event loop
 - Connection handler
 - I/O handlers
+- Write buffer with `EPOLLOUT` re-arming
 - Connection state map
 
 ## Components of the Epoll Server
@@ -103,15 +104,16 @@ func AddToEpoll(epoll_fd, fd int) error {
 This is the core runtime loop of the server, running in `RunEpollServer()`.
 
 1. Waits for events using `unix.EpollWait(epoll_fd, events, -1)`
-2. Iterates over triggered `unix.EpollEvent` entries
+2. Iterates over **only the triggered events** using `events[:n]` — iterating the full slice would process stale events from the previous iteration
 3. Dispatches each event to the appropriate handler
 
 Typical flow:
 
 1. Block on `EpollWait`
-2. Iterate over triggered events
+2. Iterate over `events[:n]`
 3. If `fd == listen_fd` → call `AcceptAll()`
-4. Otherwise → call `ReadAll()`
+4. If `EPOLLOUT` is set → call `FlushWriteBuf()` to drain the per-conn write buffer
+5. If `EPOLLIN` is set → call `ReadAll()`
 
 ---
 
@@ -122,9 +124,11 @@ Triggered when the listening socket receives `EPOLLIN`.
 1. Drains all pending connections in a loop using `unix.Accept()`
 2. Stops when `unix.EAGAIN` or `unix.EWOULDBLOCK` is returned (EPOLLET requirement)
 3. Sets each new client FD to non-blocking via `unix.SetNonblock()`
-4. Wraps the raw FD into a `net.Conn` using `FdToNetConn()` for higher-level I/O
-5. Registers the new FD with epoll via `AddToEpoll()`
-6. Stores the connection in the shared `ConnMap`
+4. Wraps the raw FD into a `net.Conn` using `FdToNetConn()`, which internally dups the FD
+5. Extracts the dup'd inner FD from the `net.Conn` via `SyscallConn().Control()` — this is the FD epoll must watch, not the original `conn_fd`
+6. Closes the original `conn_fd` since `net.Conn` now owns its own dup'd copy
+7. Stores the connection as a `*Conn` struct in `ConnMap`, keyed by `innerFd`
+8. Registers `innerFd` with epoll via `AddToEpoll()`
 
 ```go
 func AcceptAll(epoll_fd, listen_fd int) {
@@ -133,7 +137,7 @@ func AcceptAll(epoll_fd, listen_fd int) {
         if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
             return // drained
         }
-        // ... set non-blocking, wrap to net.Conn, register with epoll
+        // wrap, extract innerFd, close conn_fd, store &Conn{}, register innerFd
     }
 }
 ```
@@ -148,14 +152,34 @@ func AcceptAll(epoll_fd, listen_fd int) {
 2. Reads data in a loop using `unix.Read()` into a 4096-byte buffer
 3. Stops on `EAGAIN`/`EWOULDBLOCK` (edge-triggered drain requirement)
 4. On `n == 0` (EOF) or a real error, calls `CloseClient()` to clean up
-5. Echoes received bytes back to the client with `unix.Write()`
+5. Accumulates received bytes into `c.readBuf` on the `*Conn` struct — required for HTTP parsing where a complete request may span multiple `EPOLLIN` events
+6. Echoes received bytes back to the client via `WriteAll()`
 
-#### Write
+#### Write Handler — `WriteAll()` and `FlushWriteBuf()`
 
-Currently handled inline — the server sends a greeting immediately after accepting a new connection:
+`WriteAll()` writes as much data as possible in a loop. When the kernel send buffer is full and `unix.Write()` returns `EAGAIN`:
+
+1. The unwritten remainder is appended to `c.writeBuf` on the `*Conn` struct
+2. The FD is re-armed with `EPOLLIN | EPOLLOUT | EPOLLET` so epoll notifies when it becomes writable again
+3. `FlushWriteBuf()` is called on the next `EPOLLOUT` event to drain `c.writeBuf`
+4. Once the buffer is empty the FD is re-armed back to `EPOLLIN | EPOLLET` only
+
+This ensures no data is silently dropped when the kernel send buffer is full.
 
 ```go
-unix.Write(conn_fd, []byte("Hello from the epoll server!\n"))
+func WriteAll(fd int, data []byte) error {
+    for len(data) > 0 {
+        n, err := unix.Write(fd, data)
+        if errors.Is(err, unix.EAGAIN) {
+            // store remainder, re-arm EPOLLOUT
+            return nil
+        }
+        if errors.Is(err, unix.EINTR) { continue }
+        if err != nil { return err }
+        data = data[n:]
+    }
+    return nil
+}
 ```
 
 ---
@@ -170,16 +194,23 @@ This prevents the server from blocking on slow or inactive clients, which is ess
 
 ### 8. Connection State Management — `ConnMap`
 
-Tracks per-client connections as a `map[int]net.Conn`, keyed by raw file descriptor.
+Tracks per-client connections as a `map[int]*Conn`, keyed by the inner FD owned by `net.Conn`.
 
 ```go
+type Conn struct {
+    fd       int
+    netConn  net.Conn
+    readBuf  []byte // accumulated incoming bytes
+    writeBuf []byte // bytes waiting to be flushed
+}
+
 var (
-    ConnMap   = make(map[int]net.Conn)
+    ConnMap   = make(map[int]*Conn)
     ConnMapMu sync.Mutex
 )
 ```
 
-Access is protected by `ConnMapMu sync.Mutex` since the map is shared across handler calls. The `net.Conn` value enables use of Go's higher-level helpers (e.g. `RemoteAddr`, `bufio`) alongside the raw FD used for epoll.
+Each entry is a `*Conn` struct rather than a bare `net.Conn`, giving every connection its own read and write buffers. `readBuf` accumulates partial reads across multiple `EPOLLIN` events (needed for HTTP parsing). `writeBuf` holds data that could not be written immediately due to a full kernel send buffer. Access is protected by `ConnMapMu sync.Mutex` since the map is shared across handler calls.
 
 ---
 
@@ -236,20 +267,23 @@ The default epoll mode — repeatedly notifies as long as data is available. Not
 
 When a client disconnects or an error occurs:
 
-1. `RemoveFromEpoll()` calls `unix.EpollCtl(..., EPOLL_CTL_DEL, ...)` then `unix.Close(fd)`
-2. `CloseClient()` also closes the associated `net.Conn` and removes the entry from `ConnMap`
+1. `RemoveFromEpoll()` calls `unix.EpollCtl(..., EPOLL_CTL_DEL, ...)` to deregister the FD — it no longer closes the FD directly, since `net.Conn` owns the underlying descriptor
+2. `CloseClient()` deregisters from epoll **first**, then deletes from `ConnMap`, then closes via `c.netConn.Close()` — this order prevents a race where epoll fires one last event on an fd that has already been closed
 
 ```go
 func CloseClient(epoll_fd, fd int) {
-    RemoveFromEpoll(epoll_fd, fd)
     ConnMapMu.Lock()
-    if conn, ok := ConnMap[fd]; ok {
-        conn.Close()
-        delete(ConnMap, fd)
-    }
+    c, ok := ConnMap[fd]
+    if !ok { ConnMapMu.Unlock(); return }
+    delete(ConnMap, fd)
     ConnMapMu.Unlock()
+
+    RemoveFromEpoll(epoll_fd, fd) // deregister before closing
+    c.netConn.Close()             // closes the dup'd fd owned by net.Conn
 }
 ```
+
+`unix.Close(fd)` is intentionally absent — calling it alongside `c.netConn.Close()` would be a double-close, which can silently close an unrelated FD that the OS reused for a new connection.
 
 ---
 
@@ -261,8 +295,9 @@ func CloseClient(epoll_fd, fd int) {
 4. Register the listening FD with `AddToEpoll()`
 5. Enter the event loop — block on `unix.EpollWait()`
 6. On `listen_fd` event → `AcceptAll()` (accepts, registers, greets clients)
-7. On client FD event → `ReadAll()` (reads and echoes data)
-8. On disconnect or error → `CloseClient()` (deregisters and frees resources)
+7. On `EPOLLOUT` client event → `FlushWriteBuf()` (drains the pending write buffer)
+8. On `EPOLLIN` client event → `ReadAll()` (reads, accumulates into `readBuf`, echoes data)
+9. On disconnect or error → `CloseClient()` (deregisters then closes)
 
 ---
 
@@ -273,9 +308,10 @@ The server uses:
 - Non-blocking sockets via `unix.SetNonblock()`
 - Event-driven I/O using the `unix.EpollCreate1` / `unix.EpollCtl` / `unix.EpollWait` triad
 - Edge-triggered (`EPOLLET`) event mode with drain loops
-- A mutex-protected `map[int]net.Conn` for per-connection state
+- A mutex-protected `map[int]*Conn` for per-connection state, read buffers, and write buffers
 - `unix.Dup()` to safely extract raw FDs from Go's `net.Listener`
-- `net.FileConn()` to bridge raw FDs back to `net.Conn`
+- `net.FileConn()` to bridge raw FDs back to `net.Conn`, with `innerFd` extracted via `SyscallConn().Control()` so epoll watches the correct descriptor
+- `EPOLLOUT` re-arming when the kernel send buffer is full, with `FlushWriteBuf()` draining the backlog on the next writable event
 
 This design avoids blocking calls and allows a single goroutine to handle many clients efficiently.
 
@@ -307,7 +343,10 @@ go test ./tests/...
 - Non-blocking I/O is essential for correct edge-triggered behaviour
 - Edge-triggered mode requires draining reads/accepts until `EAGAIN`
 - `unix.Dup()` is necessary to safely extract FDs from Go's `net` abstractions
-- A mutex-protected map bridges raw FDs and `net.Conn` for clean state management
+- `net.FileConn()` internally dups the FD — always use `innerFd` from `SyscallConn().Control()` as the epoll key, not the original `conn_fd`
+- Never call both `unix.Close(fd)` and `net.Conn.Close()` on the same connection — pick one owner
+- Always deregister from epoll before closing the FD to prevent a race on the last event
+- A mutex-protected `map[int]*Conn` with per-conn read/write buffers is the foundation for any application protocol on top of raw epoll
 
 ---
 
@@ -317,8 +356,7 @@ This minimal epoll server demonstrates how Linux efficiently handles high-perfor
 
 Future improvements could include:
 
-- HTTP protocol parsing
-- Goroutine pool integration
-- Write buffering with `EPOLLOUT` registration
-- Connection pooling
+- HTTP protocol parsing (next milestone)
+- Goroutine pool integration for CPU-bound request handling
+- Connection timeouts and idle connection pruning
 - Graceful shutdown handling
